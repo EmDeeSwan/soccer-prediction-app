@@ -948,21 +948,28 @@ class MLPredictor(BasePredictor):
     
     def _initialize_ml_model(self):
         """Initialize or load the AutoML model."""
-        if self.model_path.exists():
+        # For AutoGluon, check the actual directory path, not the .pkl path
+        if AUTOML_LIBRARY == "autogluon":
+            autogluon_path = self.model_path.parent / f"ag_{self.conference}"
+            if autogluon_path.exists():
+                try:
+                    self.ml_model = TabularPredictor.load(str(autogluon_path))
+                    self.model_version = f"ag_{self.conference}"
+                    logger.info(f"Loaded existing AutoGluon model: {self.model_version}")
+                    return
+                except Exception as e:
+                    logger.warning(f"Could not load existing AutoGluon model: {e}")
+        elif self.model_path.exists():  # sklearn logic
             try:
-                if AUTOML_LIBRARY == "autogluon":
-                    self.ml_model = TabularPredictor.load(str(self.model_path))
-                    self.model_version = self.model_path.stem
-                else:
-                    with open(self.model_path, 'rb') as f:
-                        model_data = pickle.load(f)
-                        self.ml_model = model_data['model']
-                        self._feature_names = model_data['feature_names']
-                        self.model_version = model_data.get('version', self.model_path.stem)
-                logger.info(f"Loaded existing ML model: {self.model_version}")
+                with open(self.model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                    self.ml_model = model_data['model']
+                    self._feature_names = model_data['feature_names']
+                    self.model_version = model_data.get('version', self.model_path.stem)
+                logger.info(f"Loaded existing sklearn model: {self.model_version}")
                 return
             except Exception as e:
-                logger.warning(f"Could not load existing model: {e}")
+                logger.warning(f"Could not load existing sklearn model: {e}")
         
         # No model exists - will need to train
         logger.info("No pre-trained model found. Call train_model() to train a new model.")

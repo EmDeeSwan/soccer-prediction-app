@@ -4,6 +4,7 @@ import os
 import io
 import asyncio
 import json
+from types import NoneType
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -145,7 +146,7 @@ async def update_game_data(db_manager: DatabaseManager, season_year: int, confer
     print(f"   Completed: {game_stats['completed_games']}")
     print(f"   Need updates: {game_stats['games_to_update']}")
     
-    if game_stats['games_to_update'] > 0:
+    if game_stats['games_to_update'] > 0 | game_stats['games_to_update'] == NoneType:
         print(f"   Updating {game_stats['games_to_update']} games from ASA API...")
         if conference == 'both':
             await db_manager.update_games_with_asa(season_year, 'eastern')
@@ -509,7 +510,7 @@ async def main():
         await db_manager.initialize() # Ensure conferences and other initial data are set up
         print("✅ Connected!")
 
-        model_manager = MLModelManager(database)
+        model_manager = MLModelManager(db_manager)
 
         await update_game_data(
             db_manager, 
