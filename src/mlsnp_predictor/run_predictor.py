@@ -114,13 +114,32 @@ async def get_user_choices():
     # Generate charts
     generate_charts = input("Generate interactive charts? (y/n): ").lower().strip() == 'y'
     
+    # Feature importance variability (only for ML methods)
+    calculate_variability = False
+    if prediction_method in ["ml", "both"] and generate_charts:
+        calc_var = input("Calculate feature importance variability? (takes extra time) (y/n): ").lower().strip()
+        calculate_variability = calc_var == 'y'
+        
+        if calculate_variability:
+            try:
+                var_runs = int(input("Number of variability runs (10-20 recommended): ") or "15")
+                var_runs = max(10, min(var_runs, 25))  # Limit between 10-25
+            except ValueError:
+                var_runs = 15
+        else:
+            var_runs = 15
+    else:
+        var_runs = 15
+    
     return {
         'season_year': season_year,
         'conference': conference,
         'prediction_method': prediction_method,
         'n_simulations': n_simulations,
         'store_results': store_results,
-        'generate_charts': generate_charts
+        'generate_charts': generate_charts,
+        'calculate_variability': calculate_variability,
+        'variability_runs': var_runs
     }
 
 async def update_game_data(db_manager: DatabaseManager, season_year: int, conference: str):
@@ -222,7 +241,9 @@ async def run_predictions_for_conference(
     n_simulations: int,
     prediction_method: str,
     db_manager: DatabaseManager,
-    model_manager: MLModelManager
+    model_manager: MLModelManager,
+    calculate_variability: bool = False,
+    variability_runs: int = 15
 ) -> Dict:
     """Run predictions for a single conference."""
     print(f"\n{'='*60}")
@@ -326,7 +347,24 @@ async def run_predictions_for_conference(
         
         # Run predictions
         with Timer() as t:
-            summary_df, sim_results, _, qual_data = predictor.run_simulations(n_simulations)
+            if method == "ml":
+                # ML returns 5 values including feature importance
+                summary_df, sim_results, _, qual_data, feature_importance = predictor.run_simulations(n_simulations)
+            # Calculate variability if requested
+                variability_stats = {}
+                if calculate_variability:
+                    print(f"   Calculating feature importance variability ({variability_runs} runs)...")
+                    try:
+                        _, variability_stats = predictor.get_feature_importance_with_variability(variability_runs)
+                        print(f"   Variability analysis completed!")
+                    except Exception as e:
+                        logger.error(f"Variability calculation failed: {e}")
+                        print(f"   Variability analysis failed: {e}")
+            else:
+                # Monte Carlo returns 4 values
+                summary_df, sim_results, _, qual_data = predictor.run_simulations(n_simulations)
+                feature_importance = {}
+                variability_stats = {}
 
         elapsed = t.elapsed        
         print(f"   Completed in {elapsed:.1f} seconds")
@@ -335,6 +373,8 @@ async def run_predictions_for_conference(
             'summary_df': summary_df,
             'simulation_results': sim_results,
             'qualification_data': qual_data,
+            'feature_importance': feature_importance,
+            'variability_stats': variability_stats,
             'elapsed_time': elapsed
         }
     
@@ -464,20 +504,71 @@ async def save_results(results: Dict, conference: str, season_year: int, choices
     
     print(f"\n💾 Results saved to: {output_file}")
 
-def generate_charts_if_requested(summary_df, simulation_results, qualification_data, 
-                                conference, n_simulations):
+def generate_charts_if_requested(results: Dict, conference: str, 
+                                n_simulations: int, prediction_method: str):
     """
-    Generate charts if requested by the user.
+    Generate charts based on prediction method and available data.
     """
     try:
         chart_generator = MLSNPChartGenerator()
-        chart_files = chart_generator.generate_all_charts(
-            summary_df=summary_df,
-            simulation_results=simulation_results,
-            qualification_data=qualification_data,
-            conference=conference,
-            n_simulations=n_simulations
-        )
+        
+        if prediction_method == "both":
+            # Create comparison data structure
+            comparison_data = {
+                'monte_carlo': results.get('monte_carlo'),
+                'machine_learning': results.get('ml')
+            }
+            
+            # Get feature importance and variability from ML results
+            ml_data = results.get('ml', {})
+            feature_importance = ml_data.get('feature_importance', {})
+            variability_stats = ml_data.get('variability_stats', {})
+            
+            chart_files = chart_generator.generate_all_charts(
+                summary_df=None,
+                simulation_results={},
+                qualification_data={},
+                conference=conference,
+                n_simulations=n_simulations,
+                prediction_method="both",
+                feature_importance=feature_importance,
+                comparison_data=comparison_data,
+                variability_stats=variability_stats
+            )
+            
+        elif prediction_method == "ml":
+            # ML method only
+            data = results['ml']
+            feature_importance = data.get('feature_importance', {})
+            variability_stats = data.get('variability_stats', {})
+            
+            chart_files = chart_generator.generate_all_charts(
+                summary_df=data['summary_df'],
+                simulation_results=data['simulation_results'],
+                qualification_data=data['qualification_data'],
+                conference=conference,
+                n_simulations=n_simulations,
+                prediction_method="ml",
+                feature_importance=feature_importance,
+                variability_stats=variability_stats
+            )
+            
+        else:
+            # Monte Carlo method only
+            data = results['monte_carlo']
+            
+            chart_files = chart_generator.generate_all_charts(
+                summary_df=data['summary_df'],
+                simulation_results=data['simulation_results'],
+                qualification_data=data['qualification_data'],
+                conference=conference,
+                n_simulations=n_simulations,
+                prediction_method="monte_carlo"
+            )
+        
+        print(f"🔍 Chart generation completed")
+        print(f"    Method: {prediction_method}")
+        print(f"    Files created: {list(chart_files.keys())}")
         
         chart_generator.show_charts_summary(chart_files, conference)
         
@@ -485,16 +576,22 @@ def generate_charts_if_requested(summary_df, simulation_results, qualification_d
         open_dashboard = input("\nOpen dashboard in browser? (y/n): ").lower().strip()
         if open_dashboard == 'y':
             import webbrowser
-            dashboard_file = chart_files.get('dashboard')
-            if dashboard_file:
-                webbrowser.open(f'file://{os.path.abspath(dashboard_file)}')
-                print(f"Opened dashboard in browser!")
+            dashboards_opened = 0
+    
+            # Open all dashboard files
+            for key, path in chart_files.items():
+                if 'dashboard' in key and path:
+                    webbrowser.open(f'file://{os.path.abspath(path)}')
+                    dashboards_opened += 1
+            
+            if dashboards_opened > 0:
+                print(f"Opened {dashboards_opened} dashboard(s) in browser!")
+            else:
+                print("No dashboard files found to open.")
         
     except Exception as e:
         logger.error(f"Error generating charts: {e}", exc_info=True)
         print(f"Chart generation failed: {e}")
-    else:
-        print("Skipping chart generation.")
 
 
 async def main():
@@ -534,7 +631,9 @@ async def main():
                 n_simulations=choices['n_simulations'],
                 prediction_method=choices['prediction_method'],
                 db_manager=db_manager,
-                model_manager=model_manager
+                model_manager=model_manager,
+                calculate_variability=choices.get('calculate_variability', False),
+                variability_runs=choices.get('variability_runs', 15)
             )
             
             if results:
@@ -552,19 +651,13 @@ async def main():
 
             # Generate charts if requested
             if choices['generate_charts']:
-                try:
-                    for method, data in results.items():
-                        if data:
-                            generate_charts_if_requested(
-                                summary_df=data['summary_df'],
-                                simulation_results=data['simulation_results'],
-                                qualification_data=data['qualification_data'],
-                                conference=conference,
-                                n_simulations=choices['n_simulations']
-                            )
+                generate_charts_if_requested(
+                    results=results,
+                    conference=conference,
+                    n_simulations=choices['n_simulations'],
+                    prediction_method=choices['prediction_method'],
+                )
 
-                except ImportError:
-                    print("⚠️  Chart generator not available")
         print("\n All predictions completed successfully!")
     
     except Exception as e:
