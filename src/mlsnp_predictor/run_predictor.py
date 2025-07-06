@@ -4,7 +4,6 @@ import os
 import io
 import asyncio
 import json
-from types import NoneType
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -161,18 +160,24 @@ async def update_game_data(db_manager: DatabaseManager, season_year: int, confer
         values={"season_year": season_year}
     )
     
-    print(f"   Total games: {game_stats['total_games']}")
-    print(f"   Completed: {game_stats['completed_games']}")
-    print(f"   Need updates: {game_stats['games_to_update']}")
+    total_games = game_stats['total_games'] or 0
+    completed_games = game_stats['completed_games'] or 0
+    games_to_update_count = game_stats['games_to_update'] or 0
+
+    print(f"   Total games: {total_games}")
+    print(f"   Completed: {completed_games}")
+    print(f"   Need updates: {games_to_update_count}")
     
-    if game_stats['games_to_update'] > 0 | game_stats['games_to_update'] == NoneType:
-        print(f"   Updating {game_stats['games_to_update']} games from ASA API...")
+    if games_to_update_count > 0:
+        print(f"   Updating {games_to_update_count} games from ASA API...")
         if conference == 'both':
             await db_manager.update_games_with_asa(season_year, 'eastern')
             await db_manager.update_games_with_asa(season_year, 'western')
         else:
             await db_manager.update_games_with_asa(season_year, conference)
         print("Games updated!")
+    else:
+        print("   No games require updates at this time.")
 
 async def calculate_league_averages(db_manager: DatabaseManager, season_year: int) -> Dict[str, float]:
     """
