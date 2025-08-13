@@ -2,7 +2,10 @@ import logging
 import pandas as pd
 import requests # requests is used by AsaClient, but not directly in safe_api_call. Keeping for now.
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
+import time
+import functools
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -66,3 +69,58 @@ def parse_game_date(date_string: str) -> Optional[datetime]:
     
     logger.warning(f"Could not parse date: {date_string}")
     return None
+
+
+
+def time_it(func: Callable) -> Callable:
+    """
+    Decorator that logs execution time of any function.
+    This is reusable across your entire codebase!
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs) -> Any:
+        start_time = time.perf_counter()
+        
+        # Run the actual function
+        result = func(*args, **kwargs)
+        
+        # Calculate elapsed time
+        elapsed = time.perf_counter() - start_time
+        
+        # Log with function name and parameters
+        func_name = func.__name__
+        logger.info(f"{func_name} completed in {elapsed:.2f}s")
+        
+        return result
+    
+    return wrapper
+
+# Async version for route handlers
+def async_time_it(func: Callable) -> Callable:
+    """Decorator for async functions."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs) -> Any:
+        start_time = time.perf_counter()
+        
+        result = await func(*args, **kwargs)
+        
+        elapsed = time.perf_counter() - start_time
+        func_name = func.__name__
+        logger.info(f"{func_name} completed in {elapsed:.2f}s")
+        
+        return result
+    
+    return wrapper
+
+# A Timer class for when we need to access the elapsed time outside of just the log.
+class Timer:
+    """A context manager to time a block of code."""
+    def __enter__(self):
+        """Starts the timer when entering the 'with' block."""
+        self.start_time = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Ends the timer and calculates the elapsed time when exiting the block."""
+        self.end_time = time.perf_counter()
+        self.elapsed = self.end_time - self.start_time

@@ -3,14 +3,16 @@ import sys
 import os
 import io
 import asyncio
-import numpy as np
+import json
+import pandas as pd
+from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple
-from src.mlsnp_predictor.reg_season_predictor import MLSNPRegSeasonPredictor
+from typing import Dict
 from src.common.database import database
 from src.common.database_manager import DatabaseManager
-import plotly
+from src.common.classes import PredictorFactory, MLModelManager
 from src.common.chart_generator import MLSNPChartGenerator
+from src.common.utils import Timer
 
 # Ensure output directory exists
 os.makedirs('output', exist_ok=True)
@@ -32,6 +34,150 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
+async def get_user_choices():
+    """Get user input for simulation parameters."""
+    print("\n" + "="*60)
+    print("MLS NEXT PRO SEASON PREDICTOR")
+    print("="*60)
+    
+    # Season year
+    while True:
+        try:
+            season_year = int(input("\nEnter season year (e.g., 2025): ") or "2025")
+            break
+        except ValueError:
+            print("Invalid year. Please enter a number.")
+    
+    # Conference
+    print("\nWhich conference to simulate?")
+    print("  1. Eastern")
+    print("  2. Western")
+    print("  3. Both")
+    
+    conf_choice = input("Enter choice (1-3): ").strip()
+    conference_map = {"1": "eastern", "2": "western", "3": "both"}
+    conference = conference_map.get(conf_choice, "eastern")
+    
+    # Prediction method
+    available_methods = PredictorFactory.get_available_methods()
+    
+    print("\n Choose prediction method:")
+    print("  1. Monte Carlo (Traditional xG-based)")
+    if 'ml' in available_methods:
+        print("  2. Machine Learning (AutoML)")
+        print("  3. Both (Compare methods)")
+    
+    method_choice = input("Enter choice: ").strip()
+    
+    if 'ml' not in available_methods and method_choice in ["2", "3"]:
+        print(" ML not available. Using Monte Carlo only.")
+        prediction_method = "monte_carlo"
+    else:
+        method_map = {
+            "1": "monte_carlo",
+            "2": "ml",
+            "3": "both"
+        }
+        prediction_method = method_map.get(method_choice, "monte_carlo")
+    
+    # Number of simulations
+    print("\n Simulation presets:")
+    print("  1. Quick (1,000 simulations) - ~5 seconds")
+    print("  2. Standard (25,000 simulations) - ~1 minute")
+    print("  3. Detailed (50,000 simulations) - ~2 minutes")
+    print("  4. Research (100,000 simulations) - ~4 minutes")
+    print("  5. Custom")
+    
+    sim_choice = input("Enter choice (1-5): ").strip()
+    
+    sim_presets = {
+        "1": 1000,
+        "2": 25000,
+        "3": 50000,
+        "4": 100000
+    }
+    
+    if sim_choice == "5":
+        while True:
+            try:
+                n_simulations = int(input("Enter number of simulations: "))
+                break
+            except ValueError:
+                print("Invalid number. Please try again.")
+    else:
+        n_simulations = sim_presets.get(sim_choice, 25000)
+    
+    # Store results
+    store_results = input("\nStore results in database? (y/n): ").lower().strip() == 'y'
+    
+    # Generate charts
+    generate_charts = input("Generate interactive charts? (y/n): ").lower().strip() == 'y'
+    
+    # Feature importance variability (only for ML methods)
+    calculate_variability = False
+    if prediction_method in ["ml", "both"] and generate_charts:
+        calc_var = input("Calculate feature importance variability? (takes extra time) (y/n): ").lower().strip()
+        calculate_variability = calc_var == 'y'
+        
+        if calculate_variability:
+            try:
+                var_runs = int(input("Number of variability runs (10-20 recommended): ") or "15")
+                var_runs = max(10, min(var_runs, 25))  # Limit between 10-25
+            except ValueError:
+                var_runs = 15
+        else:
+            var_runs = 15
+    else:
+        var_runs = 15
+    
+    return {
+        'season_year': season_year,
+        'conference': conference,
+        'prediction_method': prediction_method,
+        'n_simulations': n_simulations,
+        'store_results': store_results,
+        'generate_charts': generate_charts,
+        'calculate_variability': calculate_variability,
+        'variability_runs': var_runs
+    }
+
+async def update_game_data(db_manager: DatabaseManager, season_year: int, conference: str):
+    """Update incomplete game data from ASA."""
+    print(f"\nChecking for game updates...")
+    
+    # Get game statistics
+    query = """
+        SELECT 
+            COUNT(*) as total_games,
+            SUM(CASE WHEN is_completed THEN 1 ELSE 0 END) as completed_games,
+            SUM(CASE WHEN NOT is_completed AND date < NOW() THEN 1 ELSE 0 END) as games_to_update
+        FROM games 
+        WHERE season_year = :season_year
+    """
+    
+    game_stats = await db_manager.db.fetch_one(
+        query,
+        values={"season_year": season_year}
+    )
+    
+    total_games = game_stats['total_games'] or 0
+    completed_games = game_stats['completed_games'] or 0
+    games_to_update_count = game_stats['games_to_update'] or 0
+
+    print(f"   Total games: {total_games}")
+    print(f"   Completed: {completed_games}")
+    print(f"   Need updates: {games_to_update_count}")
+    
+    if games_to_update_count > 0:
+        print(f"   Updating {games_to_update_count} games from ASA API...")
+        if conference == 'both':
+            await db_manager.update_games_with_asa(season_year, 'eastern')
+            await db_manager.update_games_with_asa(season_year, 'western')
+        else:
+            await db_manager.update_games_with_asa(season_year, conference)
+        print("Games updated!")
+    else:
+        print("   No games require updates at this time.")
 
 async def calculate_league_averages(db_manager: DatabaseManager, season_year: int) -> Dict[str, float]:
     """
@@ -54,11 +200,11 @@ async def calculate_league_averages(db_manager: DatabaseManager, season_year: in
         """, values={"season_year": season_year})
     except Exception as e:
         logger.error(f"Error fetching team xG data: {e}")
-        return {"league_avg_xgf": 1.2, "league_avg_xga": 1.2, "total_teams": 0, "total_games": 0}
+        return {"league_avg_xgf": 1.2, "league_avg_xga": 1.2}
     
     if not all_teams_xg:
         logger.warning(f"No xG data found for season {season_year}")
-        return {"league_avg_xgf": 1.2, "league_avg_xga": 1.2, "total_teams": 0, "total_games": 0}
+        return {"league_avg_xgf": 1.2, "league_avg_xga": 1.2}
     
     # Group by team and take most recent data point
     team_latest = {}
@@ -94,264 +240,434 @@ async def calculate_league_averages(db_manager: DatabaseManager, season_year: in
         "total_games": total_games
     }
 
-def generate_charts_if_requested(summary_df, simulation_results, qualification_data, 
-                                conference, n_simulations):
-    """
-    Ask user if they want to generate charts and create them if yes.
-    """
-    generate_charts = input(f"\nGenerate interactive charts for {conference} conference? (y/n): ").lower().strip()
+async def run_predictions_for_conference(
+    conference: str,
+    season_year: int,
+    n_simulations: int,
+    prediction_method: str,
+    db_manager: DatabaseManager,
+    model_manager: MLModelManager,
+    calculate_variability: bool = False,
+    variability_runs: int = 15
+) -> Dict:
+    """Run predictions for a single conference."""
+    print(f"\n{'='*60}")
+    print(f"Running {prediction_method} predictions for {conference.upper()} conference")
+    print(f"{'='*60}")
     
-    if generate_charts == 'y':
-        print(f"Generating interactive charts for {conference} conference...")
+    # Get conference ID
+    conf_id = 1 if conference == 'eastern' else 2
+    
+    # Get teams
+    conference_teams = await db_manager.get_conference_teams(conf_id, season_year)
+    if not conference_teams:
+        print(f" No teams found for {conference} conference")
+        return None
+    
+    print(f"Found {len(conference_teams)} teams")
+    
+    # Get all necessary data
+    print("Loading game and team data...")
+    all_games = await db_manager.get_games_for_season(season_year, conference, include_incomplete=True)
+    
+    # Get team performance data
+    team_performance = {}
+    for team_id in conference_teams.keys():
+        xg_data = await db_manager.get_or_fetch_team_xg(team_id, season_year)
+        if xg_data and xg_data.get('games_played', 0) > 0:
+            team_performance[team_id] = xg_data
+        else:
+            # Fallback data
+            team_performance[team_id] = {
+                'team_id': team_id,
+                'games_played': 1,
+                'x_goals_for': 1.2,
+                'x_goals_against': 1.2
+            }
+    
+    # Calculate league averages
+    league_averages = await calculate_league_averages(db_manager, season_year)
+    print(f"League averages: xGF={league_averages['league_avg_xgf']:.2f}, xGA={league_averages['league_avg_xga']:.2f}")
+    
+    results = {}
+    
+    # Run predictions based on method
+    if prediction_method == "both":
+        # Run both methods
+        methods = ["monte_carlo", "ml"]
+    else:
+        methods = [prediction_method]
+    
+    for method in methods:
+        print(f"\n🎯 Running {method} predictions...")
         
-        try:
-            chart_generator = MLSNPChartGenerator()
+        if method == "ml":
+            # Check for existing model
+            model_info = await model_manager.get_latest_model(conference)
+            model_path = None
+            
+            if model_info:
+                model_path = model_info['file_path']
+                print(f"   Using existing model: {model_info['version']}")
+                print(f"   Trained on: {model_info['training_date']}")
+            else:
+                print("   No existing model found.")
+                train_now = input("   Train new model now? (y/n): ").lower().strip() == 'y'
+                
+                if not train_now:
+                    print("   Skipping ML predictions.")
+                    continue
+        
+        # Create predictor
+        predictor = PredictorFactory.create_predictor(
+            method=method,
+            conference=conference,
+            conference_teams=conference_teams,
+            games_data=all_games,
+            team_performance=team_performance,
+            league_averages=league_averages,
+            model_path=model_path if method == "ml" else None
+        )
+        
+        # Train ML model if needed
+        if method == "ml" and not predictor.ml_model:
+            print("   Training new ML model (this may take a few minutes)...")
+            success = predictor.train_model(time_limit=300)
+            
+            if success:
+                # Register model in database
+                model_path = predictor.model_path
+                model_id = await model_manager.register_model(
+                    model_name=f"MLSNP {conference.title()} Predictor",
+                    conference=conference,
+                    version=predictor.model_version,
+                    file_path=str(model_path),
+                    training_games_count=len([g for g in all_games if g.get('is_completed')]),
+                    performance_metrics={"training": "successful"}
+                )
+                print(f"   Model trained and registered (ID: {model_id})")
+            else:
+                print("   Model training failed")
+                continue
+        
+        # Run predictions
+        with Timer() as t:
+            if method == "ml":
+                # ML returns 5 values including feature importance
+                summary_df, sim_results, _, qual_data, feature_importance = predictor.run_simulations(n_simulations)
+            # Calculate variability if requested
+                variability_stats = {}
+                if calculate_variability:
+                    print(f"   Calculating feature importance variability ({variability_runs} runs)...")
+                    try:
+                        _, variability_stats = predictor.get_feature_importance_with_variability(variability_runs)
+                        print(f"   Variability analysis completed!")
+                    except Exception as e:
+                        logger.error(f"Variability calculation failed: {e}")
+                        print(f"   Variability analysis failed: {e}")
+            else:
+                # Monte Carlo returns 4 values
+                summary_df, sim_results, _, qual_data = predictor.run_simulations(n_simulations)
+                feature_importance = {}
+                variability_stats = {}
+
+        elapsed = t.elapsed        
+        print(f"   Completed in {elapsed:.1f} seconds")
+        
+        results[method] = {
+            'summary_df': summary_df,
+            'simulation_results': sim_results,
+            'qualification_data': qual_data,
+            'feature_importance': feature_importance,
+            'variability_stats': variability_stats,
+            'elapsed_time': elapsed
+        }
+    
+    return results
+
+def display_results(results: Dict, conference: str):
+    """Display prediction results."""
+    print(f"\n{'='*60}")
+    print(f"RESULTS - {conference.upper()} Conference")
+    print(f"{'='*60}")
+    
+    for method, data in results.items():
+        if not data:
+            continue
+            
+        print(f"\n📊 {method.upper()} Method:")
+        print(f"   Time: {data['elapsed_time']:.1f} seconds")
+        
+        summary_df = data['summary_df']
+        
+        # Display top 10 teams
+        print(f"\n   Top 10 Teams:")
+        print(f"   {'Rank':<5} {'Team':<25} {'Current':<8} {'Playoff %':<10} {'Avg Pts':<8}")
+        print(f"   {'-'*5} {'-'*25} {'-'*8} {'-'*10} {'-'*8}")
+        
+        for idx, row in summary_df.head(10).iterrows():
+            print(f"   {idx+1:<5} {row['Team'][:24]:<25} "
+                  f"{row['Current Points']:<8} "
+                  f"{row['Playoff Qualification %']:<10.1f} "
+                  f"{row['Average Points']:<8.1f}")
+        
+        # Playoff summary
+        playoff_teams = summary_df[summary_df['Playoff Qualification %'] >= 99.0]
+        bubble_teams = summary_df[
+            (summary_df['Playoff Qualification %'] > 20) & 
+            (summary_df['Playoff Qualification %'] < 80)
+        ]
+        eliminated_teams = summary_df[summary_df['Playoff Qualification %'] < 1.0]
+        
+        print(f"\n   Playoff Picture:")
+        print(f"     Clinched (>99%): {len(playoff_teams)} teams")
+        print(f"     Bubble (20-80%): {len(bubble_teams)} teams")
+        print(f"     Eliminated (<1%): {len(eliminated_teams)} teams")
+
+
+def compare_methods(results: Dict, conference: str):
+    """Compare results between different prediction methods."""
+    if len(results) < 2:
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"METHOD COMPARISON - {conference.upper()} Conference")
+    print(f"{'='*60}")
+    
+    # Get both methods' data
+    mc_data = results.get('monte_carlo', {})
+    ml_data = results.get('ml', {})
+    
+    if not mc_data or not ml_data:
+        print("Need both methods for comparison")
+        return
+    
+    mc_df = mc_data['summary_df']
+    ml_df = ml_data['summary_df']
+    
+    # Merge on team ID
+    comparison = pd.merge(
+        mc_df[['_team_id', 'Team', 'Current Points', 'Playoff Qualification %', 'Average Points']],
+        ml_df[['_team_id', 'Playoff Qualification %', 'Average Points']],
+        on='_team_id',
+        suffixes=('_MC', '_ML')
+    )
+    
+    # Calculate differences
+    comparison['Playoff_Diff'] = comparison['Playoff Qualification %_ML'] - comparison['Playoff Qualification %_MC']
+    comparison['Points_Diff'] = comparison['Average Points_ML'] - comparison['Average Points_MC']
+    
+    # Sort by absolute playoff difference
+    comparison['Abs_Diff'] = comparison['Playoff_Diff'].abs()
+    comparison = comparison.sort_values('Abs_Diff', ascending=False)
+    
+    print(f"\n{'Team':<25} {'Current':<8} {'MC %':<8} {'ML %':<8} {'Diff':<8}")
+    print(f"{'-'*25} {'-'*8} {'-'*8} {'-'*8} {'-'*8}")
+    
+    # Show top differences
+    for _, row in comparison.head(10).iterrows():
+        arrow = "↑" if row['Playoff_Diff'] > 0 else "↓" if row['Playoff_Diff'] < 0 else "="
+        print(f"{row['Team'][:24]:<25} "
+              f"{row['Current Points']:<8.0f} "
+              f"{row['Playoff Qualification %_MC']:<8.1f} "
+              f"{row['Playoff Qualification %_ML']:<8.1f} "
+              f"{arrow} {abs(row['Playoff_Diff']):<6.1f}")
+    
+    # Summary statistics
+    print(f"\n📈 Summary Statistics:")
+    print(f"   Average playoff % difference: {comparison['Playoff_Diff'].mean():.1f}%")
+    print(f"   Max increase (ML > MC): {comparison['Playoff_Diff'].max():.1f}%")
+    print(f"   Max decrease (ML < MC): {comparison['Playoff_Diff'].min():.1f}%")
+    print(f"   Teams with >10% difference: {len(comparison[comparison['Abs_Diff'] > 10])}")
+
+
+async def save_results(results: Dict, conference: str, season_year: int, choices: Dict):
+    """Save results to file."""
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    output_data = {
+        'metadata': {
+            'conference': conference,
+            'season_year': season_year,
+            'timestamp': timestamp,
+            'choices': choices
+        },
+        'results': {}
+    }
+    
+    for method, data in results.items():
+        if data:
+            output_data['results'][method] = {
+                'elapsed_time': data['elapsed_time'],
+                'summary': data['summary_df'].to_dict('records'),
+                'qualification_data': data['qualification_data']
+            }
+    
+    output_file = f"output/{conference}_predictions_{timestamp}.json"
+    with open(output_file, 'w') as f:
+        json.dump(output_data, f, indent=2)
+    
+    print(f"\n💾 Results saved to: {output_file}")
+
+def generate_charts_if_requested(results: Dict, conference: str, 
+                                n_simulations: int, prediction_method: str):
+    """
+    Generate charts based on prediction method and available data.
+    """
+    try:
+        chart_generator = MLSNPChartGenerator()
+        
+        if prediction_method == "both":
+            # Create comparison data structure
+            comparison_data = {
+                'monte_carlo': results.get('monte_carlo'),
+                'machine_learning': results.get('ml')
+            }
+            
+            # Get feature importance and variability from ML results
+            ml_data = results.get('ml', {})
+            feature_importance = ml_data.get('feature_importance', {})
+            variability_stats = ml_data.get('variability_stats', {})
+            
             chart_files = chart_generator.generate_all_charts(
-                summary_df=summary_df,
-                simulation_results=simulation_results,
-                qualification_data=qualification_data,
+                summary_df=None,
+                simulation_results={},
+                qualification_data={},
                 conference=conference,
-                n_simulations=n_simulations
+                n_simulations=n_simulations,
+                prediction_method="both",
+                feature_importance=feature_importance,
+                comparison_data=comparison_data,
+                variability_stats=variability_stats
             )
             
-            chart_generator.show_charts_summary(chart_files, conference)
+        elif prediction_method == "ml":
+            # ML method only
+            data = results['ml']
+            feature_importance = data.get('feature_importance', {})
+            variability_stats = data.get('variability_stats', {})
             
-            # Ask if they want to open the dashboard
-            open_dashboard = input("\nOpen dashboard in browser? (y/n): ").lower().strip()
-            if open_dashboard == 'y':
-                import webbrowser
-                dashboard_file = chart_files.get('dashboard')
-                if dashboard_file:
-                    webbrowser.open(f'file://{os.path.abspath(dashboard_file)}')
-                    print(f"Opened dashboard in browser!")
+            chart_files = chart_generator.generate_all_charts(
+                summary_df=data['summary_df'],
+                simulation_results=data['simulation_results'],
+                qualification_data=data['qualification_data'],
+                conference=conference,
+                n_simulations=n_simulations,
+                prediction_method="ml",
+                feature_importance=feature_importance,
+                variability_stats=variability_stats
+            )
             
-        except Exception as e:
-            logger.error(f"Error generating charts: {e}", exc_info=True)
-            print(f"Chart generation failed: {e}")
-    else:
-        print("Skipping chart generation.")
+        else:
+            # Monte Carlo method only
+            data = results['monte_carlo']
+            
+            chart_files = chart_generator.generate_all_charts(
+                summary_df=data['summary_df'],
+                simulation_results=data['simulation_results'],
+                qualification_data=data['qualification_data'],
+                conference=conference,
+                n_simulations=n_simulations,
+                prediction_method="monte_carlo"
+            )
+        
+        print(f"🔍 Chart generation completed")
+        print(f"    Method: {prediction_method}")
+        print(f"    Files created: {list(chart_files.keys())}")
+        
+        chart_generator.show_charts_summary(chart_files, conference)
+        
+        # Ask if they want to open the dashboard
+        open_dashboard = input("\nOpen dashboard in browser? (y/n): ").lower().strip()
+        if open_dashboard == 'y':
+            import webbrowser
+            dashboards_opened = 0
+    
+            # Open all dashboard files
+            for key, path in chart_files.items():
+                if 'dashboard' in key and path:
+                    webbrowser.open(f'file://{os.path.abspath(path)}')
+                    dashboards_opened += 1
+            
+            if dashboards_opened > 0:
+                print(f"Opened {dashboards_opened} dashboard(s) in browser!")
+            else:
+                print("No dashboard files found to open.")
+        
+    except Exception as e:
+        logger.error(f"Error generating charts: {e}", exc_info=True)
+        print(f"Chart generation failed: {e}")
 
 
 async def main():
-    logger.info("Starting MLS Next Pro Predictor standalone execution...")
+    logger.info("Starting MLS Next Pro Predictor...")
     try:
+        # Get user choices
+        choices = await get_user_choices()
+
         # Connect to database
         logger.info("Connecting to database...")
         await database.connect()
         db_manager = DatabaseManager(database)
         await db_manager.initialize() # Ensure conferences and other initial data are set up
+        print("✅ Connected!")
 
-        # Prompt user for season year
-        try:
-            season_year = int(input("Enter season year to simulate (e.g., 2025): "))
-        except ValueError:
-            logger.error("Invalid season year. Please enter a number (e.g., 2025).")
-            return
+        model_manager = MLModelManager(db_manager)
 
-        # Ask user which conference to simulate
-        conference_input = input("Which conference to simulate? (eastern/western/both): ").lower().strip()
-        if conference_input not in ['eastern', 'western', 'both']:
-            logger.error("Invalid conference. Please choose 'eastern', 'western', or 'both'")
-            return
+        await update_game_data(
+            db_manager, 
+            season_year=choices['season_year'], 
+            conference=choices['conference']
+        )
         
-        # Get number of simulations
-        try:
-            n_simulations = int(input("Number of simulations (default 10000): ") or "10000")
-        except ValueError:
-            n_simulations = 10000
-
-        # Update incomplete games for the specified season year
-        logger.info(f"Updating incomplete games with ASA for {season_year}...")
-        if conference_input == 'both':
-            await db_manager.update_games_with_asa(season_year, 'eastern')
-            await db_manager.update_games_with_asa(season_year, 'western')
+        # Determine conferences to process
+        if choices['conference'] == 'both':
+            conferences = ['eastern', 'western']
         else:
-            await db_manager.update_games_with_asa(season_year, conference_input)
-        logger.info("Finished updating incomplete games.")
+            conferences = [choices['conference']]
         
-        # Calculate league averages for the specified season year
-        logger.info(f"Calculating league averages for {season_year}...")
-        league_averages = await calculate_league_averages(db_manager, season_year)
-        logger.info(f"League averages calculated: {league_averages}")
-
-        # Determine conferences to simulate based on user input
-        conferences_to_simulate: List[Tuple[str, str]] = []  # Changed to (name, name) instead of (name, id)
-        if conference_input == 'eastern':
-            conferences_to_simulate.append(('Eastern', 'eastern'))
-        elif conference_input == 'western':
-            conferences_to_simulate.append(('Western', 'western'))
-        elif conference_input == 'both':
-            conferences_to_simulate.append(('Eastern', 'eastern'))
-            conferences_to_simulate.append(('Western', 'western'))
-
-        for conf_display_name, conf_name in conferences_to_simulate:
-            logger.info(f"\n--- Starting simulation for {conf_display_name} Conference (Year: {season_year}) ---")
-
-            # Convert conference name to ID (ex. 1 = Eastern, 2 = Western)
-            conf_id = 1 if conf_name == 'eastern' else 2
-            conference_teams_map = await db_manager.get_conference_teams(conf_id, season_year)
-
-            if not conference_teams_map:
-                logger.warning(f"No teams found for {conf_display_name} Conference. Skipping simulation for this conference.")
-                continue
-
-            logger.info(f"Found {len(conference_teams_map)} teams for {conf_display_name} Conference")
-            for team_id, team_name in conference_teams_map.items():
-                logger.info(f"  - {team_name} ({team_id})")
-
-            all_games = await db_manager.get_games_for_season(season_year, include_incomplete=True)
-
-            conference_team_ids = set(conference_teams_map.keys())
-            conference_games = [
-                game for game in all_games 
-                if (game.get('home_team_id') in conference_team_ids and 
-                    game.get('away_team_id') in conference_team_ids)
-            ]
-            
-            logger.info(f"Total games in database: {len(all_games)}")
-            logger.info(f"Conference-specific games: {len(conference_games)}")
-
-            # Analyze game completion status
-            completed_games = [g for g in conference_games if g.get('is_completed')]
-            incomplete_games = [g for g in conference_games if not g.get('is_completed')]
-            games_with_scores = [g for g in conference_games if g.get('home_score') is not None]
-            
-            logger.info(f"Completed games: {len(completed_games)}")
-            logger.info(f"Incomplete games: {len(incomplete_games)}")
-            logger.info(f"Games with scores: {len(games_with_scores)}")
-
-            # Get team performance data
-            team_performance_data = {}
-            teams_with_data = 0
-            teams_with_fallback = 0
-            
-            for team_id in conference_teams_map.keys():
-                xg_data = await db_manager.get_or_fetch_team_xg(team_id, season_year)
-                if xg_data and xg_data.get('games_played', 0) > 0:
-                    team_performance_data[team_id] = xg_data
-                    teams_with_data += 1
-                    logger.debug(f"xG data for {conference_teams_map[team_id]}: {xg_data['games_played']} games, {xg_data['x_goals_for']:.2f} xGF")
-                else:
-                    # Fallback data
-                    team_performance_data[team_id] = {
-                        'team_id': team_id,
-                        'games_played': 1,
-                        'x_goals_for': league_averages['league_avg_xgf'],
-                        'x_goals_against': league_averages['league_avg_xga'],
-                        'goals_for': league_averages['league_avg_xgf'],
-                        'goals_against': league_averages['league_avg_xga']
-                    }
-                    teams_with_fallback += 1
-                    logger.warning(f"Using fallback data for {conference_teams_map[team_id]}")
-            
-            logger.info(f"Teams with xG data: {teams_with_data}, teams with fallback: {teams_with_fallback}")
-
-            # Initialize predictor with validation
-            logger.info("Initializing predictor...")
-            predictor = MLSNPRegSeasonPredictor(
-                conference=conf_name,
-                conference_teams=conference_teams_map,
-                games_data=conference_games,
-                team_performance=team_performance_data,
-                league_averages=league_averages
+        # Run predictions for each conference
+        all_results = {}
+        
+        for conference in conferences:
+            results = await run_predictions_for_conference(
+                conference=conference,
+                season_year=choices['season_year'],
+                n_simulations=choices['n_simulations'],
+                prediction_method=choices['prediction_method'],
+                db_manager=db_manager,
+                model_manager=model_manager,
+                calculate_variability=choices.get('calculate_variability', False),
+                variability_runs=choices.get('variability_runs', 15)
             )
-
-            # Validate predictor state before running simulations
-            logger.info("Validating predictor state...")
-            logger.info(f"Conference teams: {len(predictor.conference_teams)}")
-            logger.info(f"Remaining games: {len(predictor.remaining_games)}")
-            logger.info(f"Current standings teams: {len(predictor.current_standings)}")
             
-            # Check standings calculation
-            teams_with_games = [team_id for team_id, stats in predictor.current_standings.items() 
-                              if stats.get('games_played', 0) > 0]
-            logger.info(f"Teams with games played in standings: {len(teams_with_games)}")
-
-            # Run simulations
-            logger.info(f"Running {n_simulations} simulations for {conf_display_name} conference...")
-            summary_df, simulation_results, _, qualification_data = predictor.run_simulations(n_simulations)
-
-            # Better result handling and display
-            if not summary_df.empty:
-                logger.info(f"Successfully generated predictions for {conf_display_name} conference.")
+            if results:
+                all_results[conference] = results
                 
-                # Custom formatted output instead of raw pandas
-                print(f"\n{'='*80}")
-                print(f"{conf_display_name} Conference Final Standings Projection")
-                print(f"{'='*80}")
-                print(f"{'Proj':<4} {'Team':<25} {'Curr':<4} {'Pts':<4} {'GP':<4} {'Playoff %':<10} {'Avg Final':<10}")
-                print(f"{'Rank':<4} {'':<25} {'Rank':<4} {'':<4} {'':<4} {'':<10} {'Rank':<10}")
-                print(f"{'-'*80}")
+                # Display results
+                display_results(results, conference)
+                
+                # Compare methods if both were run
+                if choices['prediction_method'] == 'both':
+                    compare_methods(results, conference)
+                
+                # Save results
+                await save_results(results, conference, choices['season_year'], choices)
 
-                for idx, (_, row) in enumerate(summary_df.iterrows(), 1):
-                    team_name = row['Team'][:24]  # Truncate long names
-                    current_rank = int(row['Current Rank'])
-                    current_pts = int(row['Current Points'])
-                    games_played = int(row['Games Played'])
-                    playoff_pct = f"{row['Playoff Qualification %']:.1f}%"
-                    avg_rank = f"{row['Average Final Rank']:.2f}"
-                    
-                    print(f"{idx:<4} {team_name:<25} {current_rank:<4} {current_pts:<4} {games_played:<4} {playoff_pct:<10} {avg_rank:<10}")
-
-                print(f"{'-'*80}")
-                print(f"Total teams: {len(summary_df)}")
-                print(f"Simulations run: {n_simulations:,}")
-
-                # Additional insights
-                playoff_teams = summary_df[summary_df['Playoff Qualification %'] >= 50.0]
-                eliminated_teams = summary_df[summary_df['Playoff Qualification %'] < 1.0]
-                clinched_teams = summary_df[summary_df['Playoff Qualification %'] >= 99.9]
-
-                print(f"\nPlayoff Picture:")
-                print(f"  Teams likely to make playoffs (>50%): {len(playoff_teams)}")
-                print(f"  Teams clinched playoffs (>99.9%): {len(clinched_teams)}")
-                print(f"  Teams effectively eliminated (<1%): {len(eliminated_teams)}")
-
-                # Save results to CSV with timestamp
-                output_file = f"output/{conf_name}_season_simulation_results_{season_year}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-                summary_df.to_csv(output_file, index=False)
-                logger.info(f"Results saved to {output_file}")
-
-                # Generate charts if requested
+            # Generate charts if requested
+            if choices['generate_charts']:
                 generate_charts_if_requested(
-                    summary_df=summary_df,
-                    simulation_results=simulation_results,
-                    qualification_data=qualification_data,
-                    conference=conf_name,
-                    n_simulations=n_simulations
+                    results=results,
+                    conference=conference,
+                    n_simulations=choices['n_simulations'],
+                    prediction_method=choices['prediction_method'],
                 )
-                
-                # Store in database option
-                store_in_db = input(f"\nStore {conf_display_name} conference results in database? (y/n): ").lower().strip()
-                if store_in_db == 'y':
-                    try:
-                        run_id = await db_manager.store_simulation_run(
-                            user_id=1,  # Default for standalone
-                            conference=conf_name,
-                            n_simulations=n_simulations,
-                            season_year=season_year
-                        )
-                        
-                        await db_manager.store_simulation_results(
-                            run_id, summary_df, simulation_results, qualification_data
-                        )
-                        logger.info(f"Results stored in database with run_id: {run_id}")
-                    except Exception as e:
-                        logger.error(f"Error storing results: {e}")
-                
-            else:
-                logger.error(f"ERROR: Summary DataFrame is empty for {conf_display_name} conference!")
-                logger.error("This indicates a critical issue with data processing.")
-                
-                # Debug information
-                logger.error(f"Debug info:")
-                logger.error(f"  - Conference teams: {len(conference_teams_map)}")
-                logger.error(f"  - Games data: {len(conference_games)}")
-                logger.error(f"  - Team performance data: {len(team_performance_data)}")
-                logger.error(f"  - Predictor teams: {len(predictor.conference_teams) if predictor else 'None'}")
+
+        print("\n All predictions completed successfully!")
     
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}", exc_info=True)
+        logger.error(f"An error occurred: {e}", exc_info=True)
+        print(f"❌ An error occurred: {e}")
     
     finally:
         logger.info("Disconnecting from database...")
@@ -360,4 +676,8 @@ async def main():
     logger.info("\nMLS Next Pro Predictor execution finished.")
 
 if __name__ == "__main__":
+    # Ensure output directory exists
+    Path("output").mkdir(exist_ok=True)
+    
+    # Run the main function
     asyncio.run(main())
