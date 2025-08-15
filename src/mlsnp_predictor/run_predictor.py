@@ -620,6 +620,8 @@ async def main():
             conference=choices['conference']
         )
         
+        await db_manager.check_for_rescheduled_games(choices['season_year'])
+
         # Determine conferences to process
         if choices['conference'] == 'both':
             conferences = ['eastern', 'western']
