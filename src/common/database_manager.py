@@ -1588,3 +1588,18 @@ class DatabaseManager:
 
         logger.info(f"Found {len(rescheduled_games)} potentially rescheduled games.")
         return rescheduled_games
+
+    async def check_for_rescheduled_games(self, season_year: int):
+        """Checks for and logs any rescheduled games."""
+        logger.info("Checking for rescheduled games...")
+        rescheduled_games = await self.find_rescheduled_games(season_year)
+
+        if rescheduled_games:
+            logger.info(f"Found {len(rescheduled_games)} potentially rescheduled games:")
+            for game_pair in rescheduled_games:
+                postponed = game_pair['postponed_game']
+                rescheduled = game_pair['rescheduled_game']
+                logger.info(f"  - Postponed: {postponed['game_id']} on {postponed['date'].strftime('%Y-%m-%d')}")
+                logger.info(f"    Rescheduled to: {rescheduled['game_id']} on {rescheduled['date'].strftime('%Y-%m-%d')}")
+        else:
+            logger.info("No rescheduled games found.")

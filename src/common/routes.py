@@ -466,6 +466,9 @@ async def run_simulation_task(
     try:
         # First, ensure we have historical data loaded
         await ensure_historical_data_loaded()
+
+        # Check for rescheduled games
+        await db_manager.check_for_rescheduled_games(2025)
         
         # Update any incomplete games that should be complete by now
         await db_manager.update_games_with_asa(2025, conference)
