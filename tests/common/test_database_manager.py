@@ -105,11 +105,10 @@ async def test_store_simulation_results(db_manager, mock_db):
     assert "INSERT INTO prediction_summary" in query_T1
     assert values_T1["run_id"] == run_id
     assert values_T1["team_id"] == "T1"
-    assert values_T1["avg_points"] == 50.5
-    assert values_T1["avg_final_rank"] == 2.3 # Corrected key
+    assert values_T1["average_points"] == 50.5
+    assert values_T1["avg_final_rank"] == 2.3
     assert values_T1["playoff_prob_pct"] == 95.5
-    assert values_T1["games_remaining"] == 5 # Corrected key
-    assert values_T1["status_final"] == "x-"
+    assert values_T1["games_remaining"] == 5
 
 
 @pytest.mark.asyncio

@@ -599,6 +599,21 @@ def generate_charts_if_requested(results: Dict, conference: str,
         print(f"Chart generation failed: {e}")
 
 
+async def check_for_rescheduled_games(db_manager: DatabaseManager, season_year: int):
+    """Checks for and logs any rescheduled games."""
+    print("\nChecking for rescheduled games...")
+    rescheduled_games = await db_manager.find_rescheduled_games(season_year)
+
+    if rescheduled_games:
+        print(f"Found {len(rescheduled_games)} potentially rescheduled games:")
+        for game_pair in rescheduled_games:
+            postponed = game_pair['postponed_game']
+            rescheduled = game_pair['rescheduled_game']
+            print(f"  - Postponed: {postponed['game_id']} on {postponed['date'].strftime('%Y-%m-%d')}")
+            print(f"    Rescheduled to: {rescheduled['game_id']} on {rescheduled['date'].strftime('%Y-%m-%d')}")
+    else:
+        print("No rescheduled games found.")
+
 async def main():
     logger.info("Starting MLS Next Pro Predictor...")
     try:
@@ -620,6 +635,8 @@ async def main():
             conference=choices['conference']
         )
         
+        await check_for_rescheduled_games(db_manager, choices['season_year'])
+
         # Determine conferences to process
         if choices['conference'] == 'both':
             conferences = ['eastern', 'western']

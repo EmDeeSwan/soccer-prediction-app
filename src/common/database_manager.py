@@ -251,7 +251,7 @@ class DatabaseManager:
                 JOIN team at ON g.away_team_id = at.team_id
                 LEFT JOIN team_affiliations hta ON ht.team_id = hta.team_id AND hta.is_current = true
                 LEFT JOIN team_affiliations ata ON at.team_id = ata.team_id AND ata.is_current = true
-                WHERE g.season_year = :season_year
+                WHERE g.season_year = :season_year AND g.status != 'postponed'
             """
             values = {"season_year": season_year}
 
@@ -1545,3 +1545,46 @@ class DatabaseManager:
         
         result = await self.db.fetch_one(query, values={"season_year": season_year})
         return result['current_matchday'] if result and result['current_matchday'] else 0
+
+    async def find_rescheduled_games(self, season_year: int) -> List[Dict]:
+        """
+        Finds postponed games and looks for their rescheduled counterparts.
+        """
+        logger.info(f"Searching for rescheduled games in season {season_year}...")
+
+        postponed_query = """
+            SELECT * FROM games
+            WHERE status = 'postponed' AND season_year = :season_year
+        """
+        postponed_games = await self.db.fetch_all(postponed_query, values={"season_year": season_year})
+
+        rescheduled_games = []
+
+        for postponed_game in postponed_games:
+            scheduled_query = """
+                SELECT * FROM games
+                WHERE home_team_id = :home_team_id
+                AND away_team_id = :away_team_id
+                AND date > :postponed_date
+                AND status = 'scheduled'
+                ORDER BY date ASC
+                LIMIT 1
+            """
+
+            scheduled_game = await self.db.fetch_one(
+                scheduled_query,
+                values={
+                    "home_team_id": postponed_game['home_team_id'],
+                    "away_team_id": postponed_game['away_team_id'],
+                    "postponed_date": postponed_game['date']
+                }
+            )
+
+            if scheduled_game:
+                rescheduled_games.append({
+                    "postponed_game": dict(postponed_game),
+                    "rescheduled_game": dict(scheduled_game)
+                })
+
+        logger.info(f"Found {len(rescheduled_games)} potentially rescheduled games.")
+        return rescheduled_games
