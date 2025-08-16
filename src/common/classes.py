@@ -6,8 +6,6 @@ from pathlib import Path
 import json
 from src.common.database_manager import DatabaseManager
 from src.common.BasePredictor import BasePredictor
-from src.mlsnp_predictor.monte_carlo import MonteCarloPredictor
-from src.mlsnp_predictor.machine_learning import MLPredictor, AUTOML_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
@@ -444,6 +442,9 @@ class PredictorFactory:
         """
         # Normalize method name
         method = method.lower().replace('_', '').replace('-', '')
+
+        # Delayed imports to prevent circular dependencies
+        from src.mlsnp_predictor.monte_carlo import MonteCarloPredictor
         
         if method in ['montecarlo', 'mc', 'traditional', 'poisson']:
             logger.info(f"Creating Monte Carlo predictor for {conference} conference")
@@ -456,6 +457,7 @@ class PredictorFactory:
             )
         
         elif method in ['ml', 'machinelearning', 'automl', 'ai']:
+            from src.mlsnp_predictor.machine_learning import MLPredictor
             logger.info(f"Creating ML predictor for {conference} conference")
             return MLPredictor(
                 conference=conference,
@@ -476,6 +478,7 @@ class PredictorFactory:
     def get_available_methods() -> List[str]:
         """Get list of available prediction methods."""
         # Check if ML is available
+        from src.mlsnp_predictor.machine_learning import AUTOML_AVAILABLE
         try:
             if AUTOML_AVAILABLE:
                 return ['monte_carlo', 'ml']
