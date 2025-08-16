@@ -1247,6 +1247,23 @@ class MLSNPChartGenerator:
         )
         
         # Playoff comparison
+        fig.add_trace(
+            go.Scatter(
+                x=comparison['Playoff Qualification %_MC'],
+                y=comparison['Playoff Qualification %_ML'],
+                mode='markers+text',
+                marker=dict(size=10, color='blue', opacity=0.7),
+                text=comparison['Team'].str[:3],
+                textposition='top center',
+                name='Teams',
+                hovertemplate='<b>%{customdata[0]}</b><br>' +
+                                'Monte Carlo: %{x:.1f}%<br>' +
+                                'ML Prediction: %{y:.1f}%<extra></extra>',
+                customdata=list(zip(comparison['Team']))
+            ),
+            row=1, col=1
+        )
+
         if feature_importance:
             if variability_stats:
                 # Use variability stats with confidence intervals
