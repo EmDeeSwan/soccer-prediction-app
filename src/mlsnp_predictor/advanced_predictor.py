@@ -10,6 +10,7 @@ from src.mlsnp_predictor.reg_season_predictor import MLSNPRegSeasonPredictor
 from src.mlsnp_predictor.machine_learning import MLPredictor
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 class SingleMatchPredictor:
     """
@@ -24,9 +25,13 @@ class SingleMatchPredictor:
             self.team_to_conference = {}
             for conf_id, conf_name in [(1, "eastern"), (2, "western")]:
                 teams = await self.db_manager.get_conference_teams(conf_id, 2025)
-                for team in teams:
-                    self.team_to_conference[team['id']] = conf_name
-        return self.team_to_conference.get(team_id)
+                logger.info(f"Conference {conf_name} ({conf_id}) has teams: {teams}")
+                for team_id_conf in teams.keys():
+                    self.team_to_conference[team_id_conf] = conf_name
+                    logger.info(f"Mapping team {team_id_conf} to conference {conf_name}")
+        result = self.team_to_conference.get(team_id)
+        logger.info(f"Looking up conference for team {team_id}: {result}")
+        return result
 
     async def predict_match(self, team1_id: str, team2_id: str, model_type: str = 'monte_carlo', n_simulations: int = 10000) -> Dict[str, Any]:
         """
@@ -35,8 +40,11 @@ class SingleMatchPredictor:
         conference1 = await self._get_team_conference(team1_id)
         conference2 = await self._get_team_conference(team2_id)
 
+        logger.info(f"Team {team1_id} is in conference: {conference1}")
+        logger.info(f"Team {team2_id} is in conference: {conference2}")
+
         if conference1 != conference2 or conference1 is None:
-            raise ValueError("Both teams must be in the same, valid conference for prediction.")
+            raise ValueError(f"Teams must be in the same conference. Team {team1_id} is in {conference1}, Team {team2_id} is in {conference2}")
 
         conference = conference1
 
@@ -51,14 +59,9 @@ class SingleMatchPredictor:
 
             mc_results, ml_results = await asyncio.gather(mc_results_task, ml_results_task)
 
-            combined_probs = {}
-            for key in mc_results['probabilities']:
-                mc_prob = mc_results['probabilities'][key]
-                ml_prob = ml_results['probabilities'].get(key, 0)
-                combined_probs[key] = (mc_prob + ml_prob) / 2
-
             return {
-                "probabilities": combined_probs,
+                "monte_carlo_results": mc_results['probabilities'],
+                "ml_results": ml_results['probabilities'],
                 "potential_scores": {
                     "monte_carlo": mc_results['potential_scores'],
                     "ml": ml_results['potential_score']
@@ -72,6 +75,17 @@ class SingleMatchPredictor:
     async def _predict_with_monte_carlo(self, home_team_id: str, away_team_id: str, conference: str, n_simulations: int) -> Dict[str, Any]:
         sim_data = await self.db_manager.get_data_for_simulation(conference, 2025)
         league_averages = await self._calculate_league_averages()
+        
+        # Log team performance data for debugging
+        logger.info(f"Team performance data for {home_team_id} vs {away_team_id}:")
+        if home_team_id in sim_data["team_performance"]:
+            logger.info(f"Home team ({home_team_id}) performance: {sim_data['team_performance'][home_team_id]}")
+        else:
+            logger.warning(f"No performance data for home team {home_team_id}")
+        if away_team_id in sim_data["team_performance"]:
+            logger.info(f"Away team ({away_team_id}) performance: {sim_data['team_performance'][away_team_id]}")
+        else:
+            logger.warning(f"No performance data for away team {away_team_id}")
 
         predictor = MLSNPRegSeasonPredictor(
             conference=conference,
@@ -86,9 +100,13 @@ class SingleMatchPredictor:
         outcomes = defaultdict(int)
         scores = defaultdict(int)
 
-        for _ in range(n_simulations):
+        for sim_idx in range(n_simulations):
             h_goals, a_goals, went_to_shootout, home_wins_shootout = predictor._simulate_game(game)
-
+            
+            # For debugging Monte Carlo simulation
+            if sim_idx < 5:  # Log first 5 simulations
+                logger.info(f"Simulation {sim_idx}: Home {h_goals}-{a_goals} Away (SO: {went_to_shootout}, Home wins SO: {home_wins_shootout})")
+            
             score_key = f"{h_goals}-{a_goals}"
             scores[score_key] += 1
 
@@ -100,8 +118,10 @@ class SingleMatchPredictor:
                     outcomes['away_win_shootout'] += 1
             elif h_goals > a_goals:
                 outcomes['home_win'] += 1
-            else:
+            elif a_goals > h_goals:  # Explicitly check away team win
                 outcomes['away_win'] += 1
+            else:
+                logger.warning("Unexpected case: equal goals without shootout")
 
         total_sims = n_simulations
         draw_prob = outcomes['draw'] / total_sims
@@ -109,9 +129,17 @@ class SingleMatchPredictor:
         away_win_reg_prob = outcomes['away_win'] / total_sims
 
         home_so_win_given_draw_prob = outcomes['home_win_shootout'] / outcomes['draw'] if outcomes['draw'] > 0 else 0
+        away_so_win_given_draw_prob = 1 - home_so_win_given_draw_prob if outcomes['draw'] > 0 else 0
 
-        home_win_total = (outcomes['home_win'] + outcomes['home_win_shootout']) / total_sims
-        away_win_total = (outcomes['away_win'] + outcomes['away_win_shootout']) / total_sims
+        # Calculate expected points
+        home_expected_points = (
+            home_win_reg_prob * 3 +  # Win = 3 points
+            draw_prob * (home_so_win_given_draw_prob * 2 + away_so_win_given_draw_prob * 1)  # Draw + shootout
+        )
+        away_expected_points = (
+            away_win_reg_prob * 3 +  # Win = 3 points
+            draw_prob * (away_so_win_given_draw_prob * 2 + home_so_win_given_draw_prob * 1)  # Draw + shootout
+        )
 
         results = {
             "probabilities": {
@@ -119,11 +147,11 @@ class SingleMatchPredictor:
                 "away_win_regulation": away_win_reg_prob,
                 "draw_regulation": draw_prob,
                 "home_win_shootout_given_draw": home_so_win_given_draw_prob,
-                "away_win_shootout_given_draw": 1 - home_so_win_given_draw_prob if outcomes['draw'] > 0 else 0,
-                "home_win_total": home_win_total,
-                "away_win_total": away_win_total,
+                "away_win_shootout_given_draw": away_so_win_given_draw_prob,
+                "home_expected_points": home_expected_points,
+                "away_expected_points": away_expected_points,
             },
-            "potential_scores": sorted(scores.items(), key=lambda item: item[1], reverse=True)[:5],
+            "potential_scores": sorted(scores.items(), key=lambda item: item[1], reverse=True),
             "n_simulations": n_simulations
         }
 
@@ -147,16 +175,17 @@ class SingleMatchPredictor:
         home_features = predictor._extract_features(home_team_id, away_team_id, True)
         away_features = predictor._extract_features(away_team_id, home_team_id, False)
 
-        if predictor.AUTOML_LIBRARY == "autogluon":
-            import pandas as pd
-            home_exp_goals = predictor.ml_model.predict(pd.DataFrame([home_features]))[0]
-            away_exp_goals = predictor.ml_model.predict(pd.DataFrame([away_features]))[0]
-        else: # sklearn
-            import pandas as pd
-            home_X = pd.DataFrame([home_features])[predictor._feature_names]
-            away_X = pd.DataFrame([away_features])[predictor._feature_names]
-            home_exp_goals = predictor.ml_model.predict(home_X)[0]
-            away_exp_goals = predictor.ml_model.predict(away_X)[0]
+        import pandas as pd
+        home_df = pd.DataFrame([home_features])
+        away_df = pd.DataFrame([away_features])
+        
+        # If feature names are not specified, use all columns
+        if hasattr(predictor, '_feature_names') and predictor._feature_names:
+            home_df = home_df[predictor._feature_names]
+            away_df = away_df[predictor._feature_names]
+            
+        home_exp_goals = predictor.ml_model.predict(home_df)[0]
+        away_exp_goals = predictor.ml_model.predict(away_df)[0]
 
         home_exp_goals = max(0.1, home_exp_goals)
         away_exp_goals = max(0.1, away_exp_goals)
@@ -166,19 +195,39 @@ class SingleMatchPredictor:
         draw_prob = 1.0 - home_win_prob - away_win_prob
 
         home_shootout_win_prob_in_draw = 0.55
+        away_shootout_win_prob_in_draw = 1 - home_shootout_win_prob_in_draw
+
+        # Calculate expected points
+        home_expected_points = (
+            home_win_prob * 3 +  # Win = 3 points
+            draw_prob * (home_shootout_win_prob_in_draw * 2 + away_shootout_win_prob_in_draw * 1)  # Draw + shootout
+        )
+        away_expected_points = (
+            away_win_prob * 3 +  # Win = 3 points
+            draw_prob * (away_shootout_win_prob_in_draw * 2 + home_shootout_win_prob_in_draw * 1)  # Draw + shootout
+        )
 
         return {
             "probabilities": {
-                "home_win_total": home_win_prob,
-                "away_win_total": away_win_prob,
+                "home_win_regulation": home_win_prob,
+                "away_win_regulation": away_win_prob,
                 "draw_regulation": draw_prob,
-                "home_win_shootout": home_shootout_win_prob_in_draw,
-                "away_win_shootout": 1 - home_shootout_win_prob_in_draw,
-                "home_win_regulation": home_win_prob - (draw_prob * home_shootout_win_prob_in_draw),
-                "away_win_regulation": away_win_prob - (draw_prob * (1-home_shootout_win_prob_in_draw)),
+                "home_win_shootout_given_draw": home_shootout_win_prob_in_draw,
+                "away_win_shootout_given_draw": away_shootout_win_prob_in_draw,
+                "home_expected_points": home_expected_points,
+                "away_expected_points": away_expected_points,
             },
             "potential_score": f"{home_exp_goals:.2f}-{away_exp_goals:.2f}",
             "model_version": predictor.model_version
+        }
+
+    async def get_team_performance_data(self, team1_id: str, team2_id: str) -> Dict[str, Dict]:
+        """Get performance data for two teams."""
+        conference = await self._get_team_conference(team1_id)
+        sim_data = await self.db_manager.get_data_for_simulation(conference, 2025)
+        return {
+            team1_id: sim_data["team_performance"][team1_id],
+            team2_id: sim_data["team_performance"][team2_id]
         }
 
     async def _calculate_league_averages(self) -> Dict[str, float]:
@@ -229,8 +278,8 @@ class EndSeasonScenarioGenerator:
             self.team_to_conference = {}
             for conf_id, conf_name in [(1, "eastern"), (2, "western")]:
                 teams = await self.db_manager.get_conference_teams(conf_id, 2025)
-                for team in teams:
-                    self.team_to_conference[team['id']] = conf_name
+                for team_id in teams:
+                    self.team_to_conference[team_id] = conf_name
         return self.team_to_conference.get(team_id)
 
     async def generate_scenarios(self, team_id: str) -> Dict[str, Any]:
@@ -242,18 +291,34 @@ class EndSeasonScenarioGenerator:
 
         all_conference_teams = {t_id for t_id in sim_data["conference_teams"].keys()}
 
+        remaining_games_for_team = [
+            g for g in sim_data["games_data"]
+            if not g.get("is_completed") and (g["home_team_id"] == team_id or g["away_team_id"] == team_id)
+        ]
+
+        if len(remaining_games_for_team) > 4:
+            return {
+                "error": f"Too many games remaining for team {team_id} (> 4). Scenario generation is not feasible.",
+                "games_remaining": len(remaining_games_for_team)
+            }
+
+                remaining_games_for_team = [
+            g for g in sim_data["games_data"]
+            if not g.get("is_completed") and (g["home_team_id"] == team_id or g["away_team_id"] == team_id)
+        ]
+
+        if len(remaining_games_for_team) > 4:
+            return {
+                "error": f"Too many games remaining for team {team_id} (> 4). Scenario generation is not feasible.",
+                "games_remaining": len(remaining_games_for_team)
+            }
+
         remaining_games = [
             g for g in sim_data["games_data"]
             if not g.get("is_completed") and
                g.get("home_team_id") in all_conference_teams and
                g.get("away_team_id") in all_conference_teams
         ]
-
-        if len(remaining_games) > 5:
-            return {
-                "error": "Too many games remaining (> 5). Scenario generation is not feasible.",
-                "games_remaining": len(remaining_games)
-            }
 
         if not remaining_games:
             return {"message": "No games remaining in the season."}
@@ -271,7 +336,7 @@ class EndSeasonScenarioGenerator:
 
         game_probabilities = {}
         for game in remaining_games:
-            game_id = game['id']
+            game_id = game['game_id']
             game_probabilities[game_id] = self._get_game_probabilities(game, ml_predictor)
 
         initial_standings = self._calculate_current_standings(sim_data["games_data"], all_conference_teams, sim_data["conference_teams"])
