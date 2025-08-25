@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, ClassVar
 import logging
 from datetime import datetime
@@ -71,12 +71,6 @@ class PlayoffBracket(BaseModel):
 class LoginCredentials(BaseModel):
     username_or_email: str
     password: str
-
-class MatchPredictionRequest(BaseModel):
-    team1_id: str
-    team2_id: str
-    model_type: str = Field("monte_carlo", pattern="^(monte_carlo|ml|both)$")
-    n_simulations: Optional[int] = 10000
     
 class MLModelManager:
     """
