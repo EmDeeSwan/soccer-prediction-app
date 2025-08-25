@@ -278,11 +278,11 @@ class EndSeasonScenarioGenerator:
             self.team_to_conference = {}
             for conf_id, conf_name in [(1, "eastern"), (2, "western")]:
                 teams = await self.db_manager.get_conference_teams(conf_id, 2025)
-                for team_id in teams:
-                    self.team_to_conference[team_id] = conf_name
+                for team_id_conf in teams:
+                    self.team_to_conference[team_id_conf] = conf_name
         return self.team_to_conference.get(team_id)
 
-    async def generate_scenarios(self, team_id: str) -> Dict[str, Any]:
+    async def generate_scenarios(self, team_id: str, n_simulations: int = 100000) -> Dict[str, Any]:
         conference = await self._get_team_conference(team_id)
         if not conference:
             raise ValueError(f"Could not determine conference for team {team_id}")
@@ -296,20 +296,9 @@ class EndSeasonScenarioGenerator:
             if not g.get("is_completed") and (g["home_team_id"] == team_id or g["away_team_id"] == team_id)
         ]
 
-        if len(remaining_games_for_team) > 4:
+        if len(remaining_games_for_team) > 5:
             return {
-                "error": f"Too many games remaining for team {team_id} (> 4). Scenario generation is not feasible.",
-                "games_remaining": len(remaining_games_for_team)
-            }
-
-                remaining_games_for_team = [
-            g for g in sim_data["games_data"]
-            if not g.get("is_completed") and (g["home_team_id"] == team_id or g["away_team_id"] == team_id)
-        ]
-
-        if len(remaining_games_for_team) > 4:
-            return {
-                "error": f"Too many games remaining for team {team_id} (> 4). Scenario generation is not feasible.",
+                "error": f"Too many games remaining for team {team_id} (> 5). Scenario generation is not feasible.",
                 "games_remaining": len(remaining_games_for_team)
             }
 
@@ -323,125 +312,59 @@ class EndSeasonScenarioGenerator:
         if not remaining_games:
             return {"message": "No games remaining in the season."}
 
-        league_averages = await self._calculate_league_averages(all_conference_teams)
-        ml_predictor = MLPredictor(
+        league_averages = await SingleMatchPredictor(self.db_manager)._calculate_league_averages()
+
+        predictor = MLSNPRegSeasonPredictor(
             conference=conference,
             conference_teams=sim_data["conference_teams"],
             games_data=sim_data["games_data"],
             team_performance=sim_data["team_performance"],
             league_averages=league_averages
         )
-        if not ml_predictor.ml_model:
-            raise RuntimeError("ML model is not trained or loaded. Cannot generate scenarios.")
-
-        game_probabilities = {}
-        for game in remaining_games:
-            game_id = game['game_id']
-            game_probabilities[game_id] = self._get_game_probabilities(game, ml_predictor)
 
         initial_standings = self._calculate_current_standings(sim_data["games_data"], all_conference_teams, sim_data["conference_teams"])
         team_names = {t_id: t_name for t_id, t_name in sim_data["conference_teams"].items()}
 
-        results = defaultdict(list)
-        await self._find_scenarios(
-            remaining_games,
-            initial_standings,
-            path=[],
-            probability=1.0,
-            target_team_id=team_id,
-            game_probabilities=game_probabilities,
-            team_names=team_names,
-            results=results
-        )
+        rank_counts = defaultdict(int)
+        scenario_details = defaultdict(list)
 
-        return self._format_results(results, team_names.get(team_id, team_id))
+        for _ in range(n_simulations):
+            path = []
+            temp_standings = copy.deepcopy(initial_standings)
 
-    def _get_reg_outcome_probs(self, home_exp_goals, away_exp_goals):
-        max_goals = 10
-        p_hwr = 0
-        p_awr = 0
-        p_draw = 0
-        for h_goals in range(max_goals):
-            for a_goals in range(max_goals):
-                prob = stats.poisson.pmf(h_goals, home_exp_goals) * stats.poisson.pmf(a_goals, away_exp_goals)
-                if h_goals > a_goals:
-                    p_hwr += prob
-                elif a_goals > h_goals:
-                    p_awr += prob
-                else:
-                    p_draw += prob
+            for game in remaining_games:
+                h_goals, a_goals, went_to_shootout, home_wins_shootout = predictor._simulate_game(game)
 
-        total_p = p_hwr + p_awr + p_draw
-        if total_p == 0: return 0, 0, 0 # Avoid division by zero
-        return p_hwr / total_p, p_awr / total_p, p_draw / total_p
+                winner_id, loser_id, result_type = None, None, None
 
-    def _get_game_probabilities(self, game: Dict, predictor: MLPredictor) -> Dict[str, float]:
-        home_team_id = game["home_team_id"]
-        away_team_id = game["away_team_id"]
+                if went_to_shootout:
+                    if home_wins_shootout:
+                        winner_id, loser_id, result_type = game["home_team_id"], game["away_team_id"], "so_win"
+                        path.append(f"{team_names.get(winner_id)} beats {team_names.get(loser_id)} in SO")
+                    else:
+                        winner_id, loser_id, result_type = game["away_team_id"], game["home_team_id"], "so_win"
+                        path.append(f"{team_names.get(winner_id)} beats {team_names.get(loser_id)} in SO")
+                elif h_goals > a_goals:
+                    winner_id, loser_id, result_type = game["home_team_id"], game["away_team_id"], "win"
+                    path.append(f"{team_names.get(winner_id)} beats {team_names.get(loser_id)}")
+                else: # a_goals > h_goals
+                    winner_id, loser_id, result_type = game["away_team_id"], game["home_team_id"], "win"
+                    path.append(f"{team_names.get(winner_id)} beats {team_names.get(loser_id)}")
 
-        home_features = predictor._extract_features(home_team_id, away_team_id, True)
-        away_features = predictor._extract_features(away_team_id, home_team_id, False)
+                temp_standings = self._apply_result(temp_standings, winner_id, loser_id, result_type)
 
-        if predictor.AUTOML_LIBRARY == "autogluon":
-            import pandas as pd
-            home_exp_goals = predictor.ml_model.predict(pd.DataFrame([home_features]))[0]
-            away_exp_goals = predictor.ml_model.predict(pd.DataFrame([away_features]))[0]
-        else:
-            import pandas as pd
-            home_X = pd.DataFrame([home_features])[predictor._feature_names]
-            away_X = pd.DataFrame([away_features])[predictor._feature_names]
-            home_exp_goals = predictor.ml_model.predict(home_X)[0]
-            away_exp_goals = predictor.ml_model.predict(away_X)[0]
+            final_rank = self._calculate_final_rank(temp_standings, team_id)
+            rank_counts[final_rank] += 1
 
-        home_exp_goals = max(0.1, home_exp_goals)
-        away_exp_goals = max(0.1, away_exp_goals)
+            # Store scenario details if it's one of the first few for a given rank
+            if len(scenario_details[final_rank]) < 3:
+                scenario_details[final_rank].append({
+                    "path": path,
+                    "probability": 1.0 / n_simulations # Simplified probability for MC
+                })
 
-        p_hwr, p_awr, p_draw = self._get_reg_outcome_probs(home_exp_goals, away_exp_goals)
+        return self._format_results_from_mc(rank_counts, scenario_details, n_simulations, team_names.get(team_id, team_id))
 
-        home_shootout_win_prob_in_draw = 0.55
-
-        return {
-            "home_win_reg": p_hwr,
-            "away_win_reg": p_awr,
-            "home_win_so": p_draw * home_shootout_win_prob_in_draw,
-            "away_win_so": p_draw * (1 - home_shootout_win_prob_in_draw),
-        }
-
-    async def _find_scenarios(self, games, standings, path, probability, target_team_id, game_probabilities, team_names, results):
-        if not games:
-            final_rank = self._calculate_final_rank(standings, target_team_id)
-            results[final_rank].append({"path": path, "probability": probability})
-            return
-
-        game = games[0]
-        remaining_games = games[1:]
-
-        probs = game_probabilities[game['id']]
-        home_id, away_id = game['home_team_id'], game['away_team_id']
-
-        # Scenario 1: Home wins regulation
-        if probs['home_win_reg'] > 0:
-            new_standings = self._apply_result(standings, home_id, away_id, "win")
-            new_path = path + [f"{team_names.get(home_id)} beats {team_names.get(away_id)}"]
-            await self._find_scenarios(remaining_games, new_standings, new_path, probability * probs['home_win_reg'], target_team_id, game_probabilities, team_names, results)
-
-        # Scenario 2: Away wins regulation
-        if probs['away_win_reg'] > 0:
-            new_standings = self._apply_result(standings, away_id, home_id, "win")
-            new_path = path + [f"{team_names.get(away_id)} beats {team_names.get(home_id)}"]
-            await self._find_scenarios(remaining_games, new_standings, new_path, probability * probs['away_win_reg'], target_team_id, game_probabilities, team_names, results)
-
-        # Scenario 3: Home wins shootout
-        if probs['home_win_so'] > 0:
-            new_standings = self._apply_result(standings, home_id, away_id, "so_win")
-            new_path = path + [f"{team_names.get(home_id)} beats {team_names.get(away_id)} in SO"]
-            await self._find_scenarios(remaining_games, new_standings, new_path, probability * probs['home_win_so'], target_team_id, game_probabilities, team_names, results)
-
-        # Scenario 4: Away wins shootout
-        if probs['away_win_so'] > 0:
-            new_standings = self._apply_result(standings, away_id, home_id, "so_win")
-            new_path = path + [f"{team_names.get(away_id)} beats {team_names.get(home_id)} in SO"]
-            await self._find_scenarios(remaining_games, new_standings, new_path, probability * probs['away_win_so'], target_team_id, game_probabilities, team_names, results)
 
     def _apply_result(self, original_standings, winner_id, loser_id, result_type):
         standings = copy.deepcopy(original_standings)
@@ -475,17 +398,17 @@ class EndSeasonScenarioGenerator:
                 return rank
         return -1
 
-    def _format_results(self, results, target_team_name):
+    def _format_results_from_mc(self, rank_counts, scenario_details, n_simulations, target_team_name):
         formatted = {
             "target_team": target_team_name,
             "scenario_summary": []
         }
-        for rank, scenarios in sorted(results.items()):
-            total_prob = sum(s['probability'] for s in scenarios)
+        for rank, count in sorted(rank_counts.items()):
+            total_prob = count / n_simulations
             formatted["scenario_summary"].append({
                 "final_rank": rank,
                 "total_probability": total_prob,
-                "example_scenarios": scenarios[:3] # Show a few examples
+                "example_scenarios": scenario_details.get(rank, [])
             })
         return formatted
 
@@ -511,11 +434,6 @@ class EndSeasonScenarioGenerator:
 
             home_score = int(game.get("home_score", 0))
             away_score = int(game.get("away_score", 0))
-
-            # This is a simplified version of the logic in MLSNPRegSeasonPredictor
-            # It doesn't handle goal difference, which is fine for this purpose
-            # as we only need points, wins, and SO wins for tiebreakers.
-            # A more robust implementation would share the standings calculation logic.
 
             standings[home_id]['games_played'] += 1
             standings[away_id]['games_played'] += 1
@@ -554,27 +472,3 @@ class EndSeasonScenarioGenerator:
             standings[team_id]['goal_difference'] = standings[team_id]['goals_for'] - standings[team_id]['goals_against']
 
         return {team_id: dict(stats) for team_id, stats in standings.items()}
-
-    async def _calculate_league_averages(self, all_conference_teams: set) -> Dict[str, float]:
-        # Duplicated from SingleMatchPredictor, consider refactoring to a common utility
-        all_teams_xg = await self.db_manager.db.fetch_all("""
-            SELECT team_id, x_goals_for, x_goals_against, games_played
-            FROM team_xg_history WHERE season_year = 2025 AND games_played > 0
-            ORDER BY team_id, date_captured DESC
-        """)
-
-        team_latest = {}
-        for row in all_teams_xg:
-            if row['team_id'] not in team_latest:
-                team_latest[row['team_id']] = row
-
-        total_xgf = sum(t['x_goals_for'] for t in team_latest.values() if t['team_id'] in all_conference_teams)
-        total_xga = sum(t['x_goals_against'] for t in team_latest.values() if t['team_id'] in all_conference_teams)
-        total_games = sum(t['games_played'] for t in team_latest.values() if t['team_id'] in all_conference_teams)
-
-        if total_games > 0:
-            return {
-                "league_avg_xgf": total_xgf / total_games,
-                "league_avg_xga": total_xga / total_games
-            }
-        return {"league_avg_xgf": 1.2, "league_avg_xga": 1.2}
