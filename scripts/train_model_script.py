@@ -23,7 +23,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('output/train_model.log', encoding='utf-8', mpde='a')
+        logging.FileHandler('output/train_model.log', encoding='utf-8', mode='a')
     ]
 )
 logger = logging.getLogger(__name__)
