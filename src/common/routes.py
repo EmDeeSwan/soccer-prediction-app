@@ -5,11 +5,12 @@ from typing import Optional, List, Dict, Any
 import asyncio
 import os
 from ..auth_system import AuthManager
-from .classes import SimulationRequest, PlayoffSeedingRequest, TeamPerformance, SimulationResponse, LoginCredentials
+from .classes import SimulationRequest, PlayoffSeedingRequest, TeamPerformance, SimulationResponse, LoginCredentials, MatchPredictionRequest
 from .database import database
 from .database_manager import DatabaseManager
 from .utils import logger
 from src.mlsnp_predictor import MLSNPRegSeasonPredictor, MLSNPPlayoffPredictor
+from src.mlsnp_predictor.advanced_predictor import SingleMatchPredictor, EndSeasonScenarioGenerator
 
 router = APIRouter()
 
@@ -994,3 +995,38 @@ async def ensure_historical_data_loaded():
 
 # In-memory cache for simulation status (replace with Redis in production)
 simulation_cache = {}  # TODO: Replace with Redis or a more robust solution
+
+# ==================== Advanced Prediction Routes ====================
+
+@router.post("/simulations/predict-match", dependencies=[Depends(auth_manager.validate_token)])
+async def predict_single_match(request: MatchPredictionRequest):
+    """
+    Predict the outcome of a single match between two teams.
+    """
+    predictor = SingleMatchPredictor(db_manager)
+    try:
+        results = await predictor.predict_match(
+            request.team1_id,
+            request.team2_id,
+            request.model_type,
+            request.n_simulations
+        )
+        return results
+    except Exception as e:
+        logger.error(f"Error during single match prediction: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/simulations/end-of-season-scenarios/{team_id}", dependencies=[Depends(auth_manager.validate_token)])
+async def get_end_of_season_scenarios(team_id: str):
+    """
+    Get all possible end-of-season scenarios for a team if 5 or fewer games remain.
+    """
+    generator = EndSeasonScenarioGenerator(db_manager)
+    try:
+        scenarios = await generator.generate_scenarios(team_id)
+        if "error" in scenarios:
+            raise HTTPException(status_code=400, detail=scenarios["error"])
+        return scenarios
+    except Exception as e:
+        logger.error(f"Error generating end-of-season scenarios: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))

@@ -308,8 +308,8 @@ async def run_predictions_for_conference(
             
             if model_info:
                 model_path = model_info['file_path']
-                print(f"   Using existing model: {model_info['version']}")
-                print(f"   Trained on: {model_info['training_date']}")
+                logger.info(f"Using existing model: {model_info['version']}")
+                logger.info(f"Trained on: {model_info['training_date']}")
             else:
                 print("   No existing model found.")
                 train_now = input("   Train new model now? (y/n): ").lower().strip() == 'y'
